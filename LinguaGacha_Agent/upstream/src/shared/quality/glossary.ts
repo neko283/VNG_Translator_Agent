@@ -1,0 +1,129 @@
+import type { QualityRuleGlossaryEntry } from "../../domain/quality";
+import type { ItemTextPart } from "../item-text";
+import { compile_literal_patterns, type LiteralMatcher } from "../text/literal-matcher";
+
+/** 术语匹配与应用结果必须能回传项目条目身份。 */
+export type GlossaryEntry = QualityRuleGlossaryEntry;
+
+export type GlossarySourceField = "src" | "name_src";
+export type GlossaryTargetField = "dst" | "name_dst";
+
+export type GlossarySourceMatch = {
+  entry: GlossaryEntry; // 命中的规范术语及稳定身份
+  fields: Array<{
+    source_field: GlossarySourceField; // 实际命中的原始源文字段
+    target_field: GlossaryTargetField; // 必须检查的对应译文字段
+  }>;
+};
+
+export type GlossaryApplication = {
+  entry_id: string; // 页面筛选和校对告警共用的规则身份
+  src: string; // 展示与定位用术语源文
+  dst: string; // 目标字段中要求出现的译文
+  case_sensitive: boolean; // 回显命中规则的大小写策略
+  fields: Array<{
+    source_field: GlossarySourceField; // 触发检查的源文字段
+    target_field: GlossaryTargetField; // 被检查的译文字段
+    applied: boolean; // 目标字段是否包含 dst
+  }>;
+};
+
+export type CompiledGlossary = {
+  readonly entries: readonly GlossaryEntry[]; // 保持输入顺序的规范术语
+  readonly source_matcher: LiteralMatcher; // 以 entry_id 输出源文字段命中
+  readonly target_matcher: LiteralMatcher; // 以 entry_id 输出非空目标字段命中
+};
+
+/** 编译术语源文，entry_id 是跨页面、统计与校对链路共用的命中身份。 */
+export function compile_glossary(entries: readonly GlossaryEntry[]): CompiledGlossary {
+  const matchable_entries = entries.filter((entry) => entry.src.trim() !== "");
+  return {
+    entries: matchable_entries,
+    source_matcher: compile_literal_patterns(
+      matchable_entries.map((entry) => ({
+        key: entry.entry_id,
+        text: entry.src,
+        case_sensitive: entry.case_sensitive,
+      })),
+    ),
+    target_matcher: compile_literal_patterns(
+      matchable_entries.flatMap((entry) =>
+        entry.dst.trim() === ""
+          ? []
+          : [{ key: entry.entry_id, text: entry.dst, case_sensitive: entry.case_sensitive }],
+      ),
+    ),
+  };
+}
+
+/** 只在原始源文字段查找术语，并保留到对应译文字段的映射。 */
+export function match_glossary_source(
+  compiled: CompiledGlossary,
+  source_parts: readonly ItemTextPart[],
+): GlossarySourceMatch[] {
+  const fields_by_entry_id = new Map<string, GlossarySourceMatch["fields"]>();
+  for (const part of source_parts) {
+    if (part.field !== "src" && part.field !== "name_src") continue;
+    const source_field = part.field;
+    const target_field = part.field === "src" ? "dst" : "name_dst";
+    // 领域检查只消费术语身份与字段归属，字符坐标由高亮或替换入口按需计算。
+    compiled.source_matcher.scan_keys(part.text, (entry_id) => {
+      const fields = fields_by_entry_id.get(entry_id) ?? [];
+      fields.push({ source_field, target_field });
+      fields_by_entry_id.set(entry_id, fields);
+    });
+  }
+  return compiled.entries.flatMap((entry) => {
+    const fields = fields_by_entry_id.get(entry.entry_id);
+    return fields === undefined ? [] : [{ entry, fields }];
+  });
+}
+
+/** 按源文字段逐一确认目标译文字段是否包含术语译文。 */
+export function evaluate_glossary_applications(
+  compiled: CompiledGlossary,
+  source_matches: readonly GlossarySourceMatch[],
+  translation_parts: readonly ItemTextPart[],
+): GlossaryApplication[] {
+  const matched_ids_by_field = new Map<GlossaryTargetField, Set<string>>();
+  for (const part of translation_parts) {
+    if (part.field !== "dst" && part.field !== "name_dst") continue;
+    const matched_ids = new Set<string>();
+    compiled.target_matcher.scan_keys(part.text, (key) => matched_ids.add(key));
+    matched_ids_by_field.set(part.field, matched_ids);
+  }
+  return source_matches.flatMap(({ entry, fields }) => {
+    if (entry.dst.trim() === "") return [];
+    return [
+      {
+        entry_id: entry.entry_id,
+        src: entry.src,
+        dst: entry.dst,
+        case_sensitive: entry.case_sensitive,
+        fields: fields.map(({ source_field, target_field }) => ({
+          source_field,
+          target_field,
+          applied: matched_ids_by_field.get(target_field)?.has(entry.entry_id) ?? false,
+        })),
+      },
+    ];
+  });
+}
+
+/** 将逐字段应用结果收敛为页面使用的四态。 */
+export function resolve_glossary_application_state(
+  applications: readonly GlossaryApplication[],
+): "none" | "applied" | "partial" | "missing" {
+  const fields = applications.flatMap((application) => application.fields);
+  if (fields.length === 0) return "none";
+  const applied_count = fields.filter((field) => field.applied).length;
+  if (applied_count === fields.length) return "applied";
+  return applied_count === 0 ? "missing" : "partial";
+}
+
+/** 生成供提示词与诊断信息复用的稳定单行术语表示。 */
+export function format_glossary_entry(entry: GlossaryEntry): string {
+  return entry.info === ""
+    ? `${entry.src} -> ${entry.dst}`
+    : `${entry.src} -> ${entry.dst} #${entry.info}`;
+}

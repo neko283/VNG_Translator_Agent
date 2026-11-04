@@ -1,0 +1,86 @@
+import { Type, type Static } from "typebox";
+
+const json_primitive_schema = Type.Union([
+  Type.Null(),
+  Type.Boolean(),
+  Type.Number(),
+  Type.String(),
+]);
+export type JsonValue =
+  | Static<typeof json_primitive_schema>
+  | JsonValue[]
+  | { [key: string]: JsonValue };
+
+/** 出站快照只需可序列化，允许不可变数组和记录。 */
+export type JsonSnapshot =
+  | Static<typeof json_primitive_schema>
+  | readonly JsonSnapshot[]
+  | { readonly [key: string]: JsonSnapshot };
+
+// TypeBox 的递归 Static 在深层退化为 any，保留递归 JSON 类型并复用同一基础值域。
+export const JSON_VALUE_SCHEMA = Type.Unsafe<JsonValue>(
+  Type.Cyclic(
+    {
+      JsonValue: Type.Union([
+        json_primitive_schema,
+        Type.Array(Type.Ref("JsonValue")),
+        Type.Record(Type.String(), Type.Ref("JsonValue")),
+      ]),
+    },
+    "JsonValue",
+  ),
+);
+
+/**
+ * JsonRecord 用于边界快照，调用方必须按值复制，不能共享可变领域对象
+ */
+export type JsonRecord = Record<string, JsonValue>;
+
+/**
+ * MutableJsonRecord 只表示当前构建中的 JSON 字典，离开构建函数后仍按普通值对象流通
+ */
+export type MutableJsonRecord = Record<string, JsonValue>;
+
+/**
+ * 只收窄 JSON 对象的顶层形状；字段值合法性由具体边界继续校验。
+ */
+export function is_json_record(value: unknown): value is JsonRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * 弱类型载荷不是普通对象时返回空记录，让调用方安全读取可选字段。
+ */
+export function read_json_record(value: unknown): JsonRecord {
+  return is_json_record(value) ? value : {};
+}
+
+/**
+ * 将边界数字收窄为有限整数；空值或非法值保留调用方给出的回退。
+ */
+export function read_json_integer(value: unknown, fallback: number): number {
+  const number_value = Number(value ?? fallback);
+  return Number.isFinite(number_value) ? Math.trunc(number_value) : fallback;
+}
+
+/**
+ * 兼容持久化边界中的布尔值、0/1 和对应字符串；其它值保留调用方回退。
+ */
+export function read_json_boolean(value: unknown, fallback: boolean): boolean {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value !== 0;
+  }
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "true" || normalized === "1") {
+      return true;
+    }
+    if (normalized === "false" || normalized === "0") {
+      return false;
+    }
+  }
+  return fallback;
+}

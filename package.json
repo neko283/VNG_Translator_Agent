@@ -1,0 +1,13 @@
+{
+  "name": "vng-translator-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Portable coding-agent toolkit for visual novel translation",
+  "scripts": {
+    "setup": "npm --prefix LinguaGacha_Agent ci && npm run build",
+    "build": "npm --prefix LinguaGacha_Agent run build",
+    "doctor": "npm --prefix LinguaGacha_Agent run doctor",
+    "verify": "node check_scripts/verify.mjs"
+  },
+  "engines": { "node": ">=24.22.1" }
+}

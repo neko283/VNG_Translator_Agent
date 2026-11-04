@@ -1,0 +1,353 @@
+import fs from "node:fs";
+import type { FileHandle } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import path from "node:path";
+
+import { NativePathPolicy, default_native_path_policy } from "./native-path";
+
+/**
+ * 删除选项只暴露项目实际使用的安全子集。
+ */
+export interface NativeRemoveOptions {
+  readonly recursive?: boolean;
+  readonly force?: boolean;
+}
+
+/**
+ * 把第三方库返回的二进制对象收窄成 Node 写文件可稳定消费的 Uint8Array。
+ */
+export function normalize_native_file_bytes(content: unknown): Uint8Array {
+  if (content instanceof Uint8Array) {
+    return content;
+  }
+  if (content instanceof ArrayBuffer) {
+    return new Uint8Array(content);
+  }
+  throw new TypeError("Binary file content must be a Uint8Array or ArrayBuffer.");
+}
+
+/**
+ * Backend / worker 唯一文件系统门面，所有真实磁盘 IO 都先经过平台路径策略。
+ */
+export class NativeFs {
+  /** 同步有界读取供工作区预览使用，字节捕获期间脚本和清理无法插入。 */
+  public read_prefix(file_path: string, length: number): Buffer {
+    const handle = fs.openSync(this.to_native_path(file_path), "r");
+    try {
+      const buffer = Buffer.alloc(length);
+      let count = 0;
+      while (count < length) {
+        const size = fs.readSync(handle, buffer, count, length - count, null);
+        if (size === 0) break;
+        count += size;
+      }
+      return buffer.subarray(0, count);
+    } finally {
+      fs.closeSync(handle);
+    }
+  }
+
+  /** 打开供调用方持有的原生文件句柄。调用方负责在所有结束路径关闭句柄。 */
+  public async open_file(file_path: string, flags: string): Promise<FileHandle> {
+    return await fs.promises.open(this.to_native_path(file_path), flags);
+  }
+
+  /** 日志按字节定位，范围读取不把当天完整文件加载到内存。 */
+  public async read_range(file_path: string, offset: number, length: number): Promise<Buffer> {
+    const handle = await fs.promises.open(this.to_native_path(file_path), "r");
+    try {
+      const buffer = Buffer.alloc(length);
+      let count = 0;
+      while (count < length) {
+        const result = await handle.read(buffer, count, length - count, offset + count);
+        if (result.bytesRead === 0) break;
+        count += result.bytesRead;
+      }
+      return buffer.subarray(0, count);
+    } finally {
+      await handle.close();
+    }
+  }
+
+  /** 同步追加前只检查末尾一个字节，隔开异常退出留下的尾行。 */
+  public read_last_byte(file_path: string): number | null {
+    const handle = fs.openSync(this.to_native_path(file_path), "r");
+    try {
+      const size = fs.fstatSync(handle).size;
+      if (size === 0) return null;
+      const buffer = Buffer.alloc(1);
+      fs.readSync(handle, buffer, 0, 1, size - 1);
+      return buffer[0] ?? null;
+    } finally {
+      fs.closeSync(handle);
+    }
+  }
+
+  /**
+   * path_policy 是 Windows 长路径和跨平台路径身份的唯一策略入口。
+   */
+  public constructor(private readonly path_policy: NativePathPolicy = default_native_path_policy) {}
+
+  /**
+   * 将业务路径转换为可传给 Node / 原生模块的文件系统路径。
+   */
+  public to_native_path(file_path: string): string {
+    return this.path_policy.to_native_path(file_path);
+  }
+
+  /**
+   * 生成用于路径比较的稳定身份。
+   */
+  public to_identity_path(file_path: string): string {
+    return this.path_policy.to_identity_path(file_path);
+  }
+
+  /**
+   * 判断路径是否存在。缺失和不可访问都按 false 处理，匹配 Node existsSync 语义。
+   */
+  public exists(target_path: string): boolean {
+    return fs.existsSync(this.to_native_path(target_path));
+  }
+
+  /**
+   * 读取文件或目录状态，调用方根据业务语义判断文件类型。
+   */
+  public stat(target_path: string): fs.Stats {
+    return fs.statSync(this.to_native_path(target_path));
+  }
+
+  /** 读取入口本身，保留目录链接与失效链接的身份。 */
+  public lstat(target_path: string): fs.Stats {
+    return fs.lstatSync(this.to_native_path(target_path));
+  }
+
+  /** 读取链接保存的目标文本，调用方按原入口位置解释相对目标。 */
+  public read_link(link_path: string): string {
+    return fs.readlinkSync(this.to_native_path(link_path));
+  }
+
+  /**
+   * 解析现存路径的真实位置，供受控根目录检查阻断符号链接越界。
+   */
+  public real_path(target_path: string): string {
+    return fs.realpathSync.native(this.to_native_path(target_path));
+  }
+
+  /**
+   * 读取目录项名称，供只关心文件名的列表场景使用。
+   */
+  public read_dir_names(directory: string): string[] {
+    return fs.readdirSync(this.to_native_path(directory));
+  }
+
+  /**
+   * 读取目录项和类型信息，供递归扫描避免额外 stat。
+   */
+  public read_dirents(directory: string): fs.Dirent[] {
+    return fs.readdirSync(this.to_native_path(directory), { withFileTypes: true });
+  }
+
+  /** 原子占用新会话目录，碰撞由调用方重新生成身份。 */
+  public async make_dir_exclusive(directory: string): Promise<void> {
+    await fs.promises.mkdir(this.to_native_path(directory));
+  }
+
+  /** 深层文件写入不会可靠更新时间，工作区由宿主显式记录最近使用。 */
+  public async touch_directory(directory: string): Promise<void> {
+    const now = new Date();
+    await fs.promises.utimes(this.to_native_path(directory), now, now);
+  }
+
+  /**
+   * 判断目录创建是否可以跳过。空目录和文件系统根都不是可创建的业务目录。
+   */
+  private should_skip_make_dir(directory: string): boolean {
+    return directory === "" || this.path_policy.is_filesystem_root(directory);
+  }
+
+  /**
+   * 异步递归创建目录，和同步入口共享根目录 no-op 语义。
+   */
+  public async make_dir_async(directory: string): Promise<void> {
+    if (this.should_skip_make_dir(directory)) {
+      return;
+    }
+    await fs.promises.mkdir(this.to_native_path(directory), { recursive: true });
+  }
+
+  /**
+   * 递归创建目录。空目录和文件系统根目录视为已存在，无需额外动作。
+   */
+  public make_dir(directory: string): void {
+    if (this.should_skip_make_dir(directory)) {
+      return;
+    }
+    fs.mkdirSync(this.to_native_path(directory), { recursive: true });
+  }
+
+  /**
+   * 确保目标文件的父目录存在。
+   */
+  public ensure_parent_dir(file_path: string): void {
+    this.make_dir(path.dirname(file_path));
+  }
+
+  /**
+   * 同步读取二进制文件。
+   */
+  public read_file(file_path: string): Buffer {
+    return fs.readFileSync(this.to_native_path(file_path));
+  }
+
+  /**
+   * 同步读取文本文件。
+   */
+  public read_text_file(file_path: string, encoding: BufferEncoding = "utf-8"): string {
+    return fs.readFileSync(this.to_native_path(file_path), encoding);
+  }
+
+  /** 流式读取大文件，仍复用平台长路径策略。 */
+  public create_read_stream(file_path: string): fs.ReadStream {
+    return fs.createReadStream(this.to_native_path(file_path));
+  }
+
+  /** 流式写入大文件，并同步补齐父目录后立即返回 writable。 */
+  public create_write_stream(file_path: string): fs.WriteStream {
+    this.ensure_parent_dir(file_path);
+    return fs.createWriteStream(this.to_native_path(file_path));
+  }
+
+  /**
+   * 异步写入二进制或文本文件，并在写入前创建父目录。
+   */
+  public async write_file(file_path: string, data: string | Uint8Array): Promise<void> {
+    await this.make_dir_async(path.dirname(file_path));
+    await fs.promises.writeFile(this.to_native_path(file_path), data);
+  }
+
+  /**
+   * 同步写入二进制或文本文件，并在写入前创建父目录。
+   */
+  public write_file_sync(file_path: string, data: string | Uint8Array): void {
+    this.ensure_parent_dir(file_path);
+    fs.writeFileSync(this.to_native_path(file_path), data);
+  }
+
+  /** 排他创建空文件，成功返回后由调用者负责清理。 */
+  public create_file_exclusive(file_path: string): void {
+    this.ensure_parent_dir(file_path);
+    fs.closeSync(fs.openSync(this.to_native_path(file_path), "wx"));
+  }
+
+  /**
+   * 同步追加日志文本。日志目录缺失时由门面补齐。
+   */
+  public append_text_file(file_path: string, text: string): void {
+    this.ensure_parent_dir(file_path);
+    fs.appendFileSync(this.to_native_path(file_path), text, "utf-8");
+  }
+
+  /**
+   * 同步重命名路径，调用方负责校验业务边界。
+   */
+  public rename(source_path: string, destination_path: string): void {
+    this.ensure_parent_dir(destination_path);
+    fs.renameSync(this.to_native_path(source_path), this.to_native_path(destination_path));
+  }
+
+  /**
+   * 同步复制单个文件，调用方负责决定覆盖语义。
+   */
+  public copy_file(source_path: string, destination_path: string): void {
+    this.ensure_parent_dir(destination_path);
+    fs.copyFileSync(this.to_native_path(source_path), this.to_native_path(destination_path));
+  }
+
+  /** 同目录临时文件完整复制后才替换目标，复制或替换失败保留已有目标。 */
+  public copy_file_atomic(source_path: string, destination_path: string): void {
+    this.replace_file_atomic(destination_path, (temporary) =>
+      this.copy_file(source_path, temporary),
+    );
+  }
+
+  /** 完整写入同目录临时文件后替换目标，供需要保留旧文件的保存入口使用。 */
+  public write_file_atomic(file_path: string, data: string | Uint8Array): void {
+    this.replace_file_atomic(file_path, (temporary) => this.write_file_sync(temporary, data));
+  }
+
+  /** 复制与写入共用替换及失败清理，清理异常与原始异常一起保留。 */
+  private replace_file_atomic(
+    destination_path: string,
+    prepare: (temporary: string) => void,
+  ): void {
+    const temporary_path = path.join(path.dirname(destination_path), `.${randomUUID()}.tmp`);
+    try {
+      prepare(temporary_path);
+      this.rename(temporary_path, destination_path);
+    } catch (cause) {
+      try {
+        // 准备失败可能尚未建立临时文件，缺失时清理已完成。
+        this.unlink(temporary_path, { force: true });
+      } catch (cleanup_error) {
+        throw new AggregateError([cause, cleanup_error], "File replacement and cleanup failed.", {
+          cause,
+        });
+      }
+      throw cause;
+    }
+  }
+
+  /**
+   * 同步复制文件或目录，保持迁移场景的目录递归语义集中。
+   */
+  public copy_entry(source_path: string, destination_path: string): void {
+    this.ensure_parent_dir(destination_path);
+    const native_source = this.to_native_path(source_path);
+    const native_destination = this.to_native_path(destination_path);
+    if (fs.statSync(native_source).isDirectory()) {
+      fs.cpSync(native_source, native_destination, { recursive: true });
+      return;
+    }
+    fs.copyFileSync(native_source, native_destination);
+  }
+
+  /** 用户文件和目录统一异步删除。Electron 的同步递归删除不能可靠处理 Windows 只读属性。 */
+  public async remove_async(target_path: string, options: NativeRemoveOptions = {}): Promise<void> {
+    await fs.promises.rm(this.to_native_path(target_path), options);
+  }
+
+  /**
+   * 同步删除单个文件，语义等同 unlinkSync。
+   */
+  public unlink(target_path: string, options: Pick<NativeRemoveOptions, "force"> = {}): void {
+    try {
+      fs.unlinkSync(this.to_native_path(target_path));
+    } catch (error) {
+      // 临时文件可能尚未创建。只有明确允许缺失的清理操作忽略 ENOENT。
+      if (options.force && error instanceof Error && "code" in error && error.code === "ENOENT")
+        return;
+      throw error;
+    }
+  }
+
+  /** 创建绝对目标的目录链接，Windows 使用无需提权的目录联接。 */
+  public create_directory_link(target_path: string, link_path: string): void {
+    fs.symlinkSync(
+      this.to_native_path(path.resolve(target_path)),
+      this.to_native_path(link_path),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+  }
+
+  /**
+   * 删除空目录，迁移清理旧目录时保留 rmdir 的严格语义。
+   */
+  public remove_empty_dir(directory: string): void {
+    fs.rmdirSync(this.to_native_path(directory));
+  }
+}
+
+/**
+ * 默认 NativeFs 实例，生产代码只共享这个门面而不直接触碰 node:fs。
+ */
+export const default_native_fs = new NativeFs();

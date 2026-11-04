@@ -1,0 +1,140 @@
+import type { TextFileContext } from "./text-rule-type";
+import { normalize_quality_rule_entries } from "../quality/quality-rule-entry";
+import { read_json_record, type JsonRecord, type JsonValue } from "../../domain/json";
+import { normalize_translation_prompt_slice } from "../../domain/prompt";
+import {
+  ALL_LANGUAGE_CODE,
+  normalize_source_language_code,
+  normalize_target_language_code,
+  type ConfiguredSourceLanguageCode,
+  type TargetLanguageCode,
+} from "../../domain/language";
+import { normalize_setting_snapshot } from "../../domain/setting";
+import {
+  QualityRule,
+  type GlossaryEntry,
+  type TextPreserveMode,
+  type TextPreserveEntry,
+  type TextReplacementEntry,
+} from "../../domain/quality";
+import { AppError } from "../error";
+
+/** 翻译与校对共享的文本处理配置。 */
+export interface TextProcessingConfig {
+  file_contexts?: Readonly<Record<string, TextFileContext>>;
+  source_language: ConfiguredSourceLanguageCode; // 源/目标语言在快照恢复时完成归一与校验
+  target_language: TargetLanguageCode;
+  clean_ruby: boolean; // 只控制字面文本注音标记，结构化格式组装留在导入器
+}
+
+/** 将外部设置收窄为翻译与校对共享的规范语言配置。 */
+export function normalize_text_processing_config(args: {
+  source_language: string;
+  target_language: string;
+  clean_ruby: boolean;
+}): TextProcessingConfig {
+  const source_language = normalize_source_language_code(args.source_language);
+  if (source_language === null) {
+    throw new AppError("language.unknown_source_language_code", {
+      public_details: { source_language: args.source_language },
+      diagnostic_context: { source_language: args.source_language },
+    });
+  }
+  const target_language = normalize_target_language_code(args.target_language);
+  if (target_language === null) {
+    throw new AppError(
+      args.target_language.trim().toUpperCase() === ALL_LANGUAGE_CODE
+        ? "language.unsupported_all_target_language"
+        : "language.invalid_target_language",
+    );
+  }
+  return {
+    source_language,
+    target_language,
+    clean_ruby: args.clean_ruby,
+  };
+}
+
+/**
+ * 质量规则快照归一后只保留 worker 必须知道的稳定事实
+ */
+export interface TextQualitySnapshot {
+  file_contexts?: Readonly<Record<string, TextFileContext>>;
+  glossary_enable: boolean; // glossary 与 replacement 规则均为运行时快照，worker 不回读数据库
+  glossary_entries: GlossaryEntry[];
+  text_preserve_mode: TextPreserveMode;
+  text_preserve_entries: TextPreserveEntry[];
+  pre_replacement_enable: boolean;
+  pre_replacement_entries: TextReplacementEntry[];
+  post_replacement_enable: boolean;
+  post_replacement_entries: TextReplacementEntry[];
+  translation_prompt_enable: boolean; // prompt 字段来自提示词设置页，PromptBuilder 负责与资源模板合并
+  translation_prompt: string | null;
+}
+
+/**
+ * 任务 item 的最小形状，runner 只按这些字段读写翻译事实
+ */
+export type TextTaskItemRecord = JsonRecord & {
+  id?: number; // id/item_id 同时兼容数据库行和前端运行态条目
+  item_id?: number;
+  src?: string; // src/dst/status 是翻译提交的核心事实，其余字段只辅助处理
+  dst?: string;
+  name_src?: string | string[] | null;
+  name_dst?: string | string[] | null;
+  status?: string;
+  file_type?: string;
+  file_path?: string;
+  skip_internal_filter?: boolean; // 强制翻译在译前准备中同样绕过内容过滤。
+  extra_field?: JsonValue; // 保留格式处理器回写所需的结构化上下文
+};
+
+/** 从嵌套质量载荷直接解析任务规则，缺失字段沿用领域默认值。 */
+export function read_text_quality_snapshot(value: unknown): TextQualitySnapshot {
+  const root = read_json_record(value);
+  const quality = read_json_record(root["quality"]);
+  const prompts = read_json_record(root["prompts"]);
+  const glossary = read_json_record(quality["glossary"]);
+  const text_preserve = read_json_record(quality["text_preserve"]);
+  const pre_replacement = read_json_record(quality["pre_replacement"]);
+  const post_replacement = read_json_record(quality["post_replacement"]);
+  const translation = normalize_translation_prompt_slice(prompts["translation"]);
+  const glossary_rule = QualityRule.from_json("glossary");
+  const text_preserve_rule = QualityRule.from_json("text_preserve");
+  const pre_replacement_rule = QualityRule.from_json("pre_replacement");
+  const post_replacement_rule = QualityRule.from_json("post_replacement");
+
+  return {
+    glossary_enable: glossary_rule.normalize_enabled(glossary["enabled"]),
+    text_preserve_mode: text_preserve_rule.normalize_mode(text_preserve["mode"]),
+    text_preserve_entries: normalize_quality_rule_entries(
+      text_preserve_rule,
+      text_preserve["entries"] ?? [],
+    ),
+    pre_replacement_enable: pre_replacement_rule.normalize_enabled(pre_replacement["enabled"]),
+    pre_replacement_entries: normalize_quality_rule_entries(
+      pre_replacement_rule,
+      pre_replacement["entries"] ?? [],
+    ),
+    post_replacement_enable: post_replacement_rule.normalize_enabled(post_replacement["enabled"]),
+    post_replacement_entries: normalize_quality_rule_entries(
+      post_replacement_rule,
+      post_replacement["entries"] ?? [],
+    ),
+    translation_prompt_enable: translation.enabled,
+    translation_prompt: translation.text,
+
+    glossary_entries: normalize_quality_rule_entries(glossary_rule, glossary["entries"] ?? []),
+  };
+}
+
+/** 从执行快照提取文本处理字段，并在任务入口校验语言。 */
+export function read_text_processing_config(value: JsonValue | undefined): TextProcessingConfig {
+  // 语言来自项目而非应用设置，应用设置归一化会丢弃它们，因此直接读取原始执行快照。
+  const record = read_json_record(value);
+  return normalize_text_processing_config({
+    source_language: String(record["source_language"] ?? ""),
+    target_language: String(record["target_language"] ?? ""),
+    clean_ruby: normalize_setting_snapshot(value).clean_ruby,
+  });
+}

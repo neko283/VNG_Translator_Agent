@@ -1,0 +1,292 @@
+import type { LogError } from "./error/log-error";
+import type { JsonRecord } from "../domain/json";
+
+const LOG_LEVELS = ["debug", "info", "warning", "error", "fatal"] as const; // 日志等级由正文、索引和日志窗口筛选共用
+
+export const LOG_WINDOW_ENTRY_CAPACITY = 8 * 1024; // 日志窗口摘要缓存上限，历史通过分页继续读取
+
+export const LOG_WINDOW_MESSAGE_PREVIEW_LENGTH = 1024; // 日志列表只消费预览，完整正文按需从日志文件读取
+
+export type LogLevel = (typeof LOG_LEVELS)[number];
+
+export interface LogTargets {
+  console: boolean; // 输出到控制台
+  window: boolean; // 记录是否出现在日志窗口
+}
+
+export interface LogEntry {
+  id: string; // 日期与物理行号组成的 ID
+  date: string; // 所属日期文件
+  line: number; // 从 1 开始的物理行号，隐藏及损坏行同样计数
+  revision: string; // 所属文件内容代次，用于拒绝外部编辑前的详情请求
+  created_at: string; // ISO 时间戳
+  level: LogLevel; // 公开日志等级
+  source: string; // 产生日志的模块或任务源
+  message_preview: string; // 已格式化日志正文预览，供列表与筛选使用
+  message_length: number; // 完整正文字符数，供 UI 判断详情体量
+}
+
+/** 模型响应的可选过程段，标题已按任务启动语言冻结。 */
+export type LogTextSection = {
+  title: string; // 思考过程、规则分析或原始响应等稳定标题
+  text: string; // 保留换行的完整段落正文
+};
+
+/** 翻译结果的一组原文、译文与可选角色名。 */
+export type LogTranslationPair = {
+  src: string; // 单行原文
+  dst: string; // 与原文对齐的单行译文
+  actor_src?: string | null; // 字段存在表示角色模式，null 表示该行没有角色名
+  actor_dst?: string | null; // 字段存在表示角色模式，null 表示该行没有译名
+};
+
+/** 日志正文的跨进程判别联合；文件保存完整结构，控制台和列表消费纯文本投影。 */
+export type LogContent =
+  | string
+  | { kind: "text"; text: string } // 已组装的可读正文，异常详情独立保存与展示。
+  | (JsonRecord & { kind: "agent" })
+  | {
+      kind: "translation_result";
+      summary: string[]; // 统计、状态和重试摘要
+      sections: LogTextSection[]; // 模型响应过程
+      pairs: LogTranslationPair[]; // 按输入顺序排列的翻译对照
+      started_at: string; // worker 开始模型请求的时间
+      ended_at: string; // worker 完成响应处理的时间
+    };
+
+/** 文件与详情共用的日志事实，查询身份和输出显隐由各自边界补齐。 */
+export interface LogRecord {
+  created_at: string; // ISO 创建时间
+  level: LogLevel; // 日志等级
+  source: string; // 产生日志的模块或任务源
+  content: LogContent; // 完整结构化正文，通过详情接口按需读取
+  error?: LogError; // Error 的可序列化边界快照
+  context?: Record<string, unknown>; // 额外结构化上下文
+}
+
+export interface LogFileRecord extends LogRecord {
+  window?: false; // 缺省显示，仅隐藏记录写入 false
+}
+
+export interface LogDetail extends LogRecord {
+  id: string; // 与 LogEntry.id 一一对应
+  date: string; // 所属日期文件
+  line: number; // 正文物理行号
+  revision: string; // 所属文件内容代次
+}
+
+export interface LogAppendPayload {
+  level: LogLevel; // 写入等级
+  content: LogContent; // 单一日志正文事实，输出目标按需投影为纯文本
+  source?: string; // 产生日志的模块或任务源
+  error?: unknown; // 进程内可传原始 Error，跨边界只传 LogError 快照
+  context?: Record<string, unknown>; // 额外结构化上下文
+  targets?: Partial<LogTargets>; // 单次写入的输出目标覆盖
+}
+
+export interface LogCursor {
+  date: string;
+  line: number; // 此边界已处理的正文物理行数，0 表示文件起点
+  revision: string; // 文件内容代次，正文外部修改或索引重建后失效
+}
+
+export interface LogPageRequest {
+  date: string; // 所有读取都限定于这个日期文件
+  direction: "latest" | "before" | "after" | "check";
+  cursor?: LogCursor;
+  limit?: number;
+}
+
+export interface LogPage {
+  status: "ready" | "expired" | "cursor_invalid";
+  entries: LogEntry[];
+  before: LogCursor | null;
+  after: LogCursor | null;
+  has_more: boolean;
+}
+
+export const LOG_PAGE_SIZE = 200;
+export const LOG_POLL_INTERVAL_MS = 500;
+
+const LOG_LEVEL_SET = new Set<LogLevel>(LOG_LEVELS);
+
+// 边界反序列化先用判定函数收窄，避免未知日志等级进入 UI 筛选
+function is_log_level(value: unknown): value is LogLevel {
+  return LOG_LEVEL_SET.has(value as LogLevel);
+}
+
+// 旧配置或外部 payload 的未知日志等级统一降级为 info
+export function normalize_log_level(value: unknown): LogLevel {
+  return is_log_level(value) ? value : "info";
+}
+
+/** 文件与 HTTP 详情共用正文校验，保持生产者、存储和显示的单一契约。 */
+export function read_log_content(value: unknown): LogContent | null {
+  if (typeof value === "string") return value;
+  const content = read_record(value);
+  if (content === null) {
+    return null;
+  }
+
+  switch (content["kind"]) {
+    case "text":
+      return typeof content["text"] === "string" ? { kind: "text", text: content["text"] } : null;
+    case "agent":
+      // Agent 正文只按 JSON 展示；事件字段由后端生产者约束，不在读取端重复定义。
+      return structuredClone(content) as JsonRecord & { kind: "agent" };
+    case "translation_result": {
+      const summary = read_string_array(content["summary"]);
+      const sections = read_text_sections(content["sections"]);
+      const pairs = read_translation_pairs(content["pairs"]);
+      const started_at = content["started_at"];
+      const ended_at = content["ended_at"];
+      return summary === null ||
+        sections === null ||
+        pairs === null ||
+        typeof started_at !== "string" ||
+        typeof ended_at !== "string"
+        ? null
+        : {
+            kind: "translation_result",
+            summary,
+            sections,
+            pairs,
+            started_at,
+            ended_at,
+          };
+    }
+
+    default:
+      return null;
+  }
+}
+
+/**
+ * 文件、控制台与列表预览共用同一纯文本投影，结构化内容本身保存在正文文件中。
+ */
+export function format_log_content_text(content: LogContent): string {
+  if (typeof content === "string") return content;
+  if (content.kind === "text") return content.text;
+  if (content.kind === "agent") return JSON.stringify(content, null, 2);
+
+  const rows = [
+    ...content.summary,
+    ...content.sections.map((section) => `${section.title}\n${section.text}`),
+  ];
+  {
+    const pair_lines: string[] = [];
+    content.pairs.forEach((pair, index) => {
+      pair_lines.push(`[${String(index + 1)}]`);
+      pair_lines.push(`SRC: ${pair.src}`);
+      if (Object.hasOwn(pair, "actor_src")) {
+        pair_lines.push(`ACTOR_SRC: ${pair.actor_src ?? "null"}`);
+      }
+      pair_lines.push(`DST: ${pair.dst}`);
+      if (Object.hasOwn(pair, "actor_dst")) {
+        pair_lines.push(`ACTOR_DST: ${pair.actor_dst ?? "null"}`);
+      }
+    });
+    if (pair_lines.length > 0) {
+      rows.push(pair_lines.join("\n"));
+    }
+  }
+
+  return `${rows.filter((row) => row.trim() !== "").join("\n\n")}\n`;
+}
+
+// 普通文本与 Agent JSON 附带异常消息，翻译摘要已包含用户错误。
+export function format_log_readable_text(detail: Pick<LogDetail, "content" | "error">): string {
+  if (typeof detail.content !== "string" && detail.content.kind === "text")
+    return detail.content.text;
+  return [
+    format_log_content_text(detail.content),
+    format_log_error_text(
+      detail.error,
+      typeof detail.content === "string" || detail.content.kind === "agent",
+    ),
+  ]
+    .filter((value) => value.trim() !== "")
+    .join("\n");
+}
+
+/** 窗口、控制台与结构化日志共用异常投影，原因链和诊断字段随外层堆栈一起显示。 */
+export function format_log_error_text(
+  error: LogError | undefined,
+  include_message: boolean,
+): string {
+  if (error === undefined) return "";
+  return [
+    include_message ? error.message : undefined,
+    error.stack,
+    ...(error.cause_chain ?? []).flatMap((cause) => [
+      cause.stack ?? `${cause.name ?? "Error"}: ${cause.message}`,
+      cause.context === undefined ? undefined : JSON.stringify(cause.context, null, 2),
+    ]),
+    error.context === undefined ? undefined : JSON.stringify(error.context, null, 2),
+  ]
+    .filter((value) => value !== undefined && value.trim() !== "")
+    .join("\n");
+}
+
+/** 将未知边界值收窄为非数组对象。 */
+function read_record(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+/** 严格读取字符串数组并复制，避免把传输对象引用交给调用方。 */
+function read_string_array(value: unknown): string[] | null {
+  return Array.isArray(value) && value.every((item) => typeof item === "string")
+    ? [...value]
+    : null;
+}
+
+/** 严格读取模型响应过程段。 */
+function read_text_sections(value: unknown): LogTextSection[] | null {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  const sections: LogTextSection[] = [];
+  for (const item of value) {
+    const section = read_record(item);
+    if (
+      section === null ||
+      typeof section["title"] !== "string" ||
+      typeof section["text"] !== "string"
+    ) {
+      return null;
+    }
+    sections.push({ title: section["title"], text: section["text"] });
+  }
+  return sections;
+}
+
+/** 严格读取翻译对照；角色字段缺失与显式 null 保持不同语义。 */
+function read_translation_pairs(value: unknown): LogTranslationPair[] | null {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  const pairs: LogTranslationPair[] = [];
+  for (const item of value) {
+    const pair = read_record(item);
+    if (pair === null || typeof pair["src"] !== "string" || typeof pair["dst"] !== "string") {
+      return null;
+    }
+    const actor_src = pair["actor_src"];
+    const actor_dst = pair["actor_dst"];
+    if (
+      (actor_src !== undefined && actor_src !== null && typeof actor_src !== "string") ||
+      (actor_dst !== undefined && actor_dst !== null && typeof actor_dst !== "string")
+    ) {
+      return null;
+    }
+    pairs.push({
+      src: pair["src"],
+      dst: pair["dst"],
+      ...(actor_src === undefined ? {} : { actor_src }),
+      ...(actor_dst === undefined ? {} : { actor_dst }),
+    });
+  }
+  return pairs;
+}

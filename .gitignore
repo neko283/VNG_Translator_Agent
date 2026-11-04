@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.npm-cache/
+.test-work/
+__pycache__/
+*.pyc
+.DS_Store
+*.lg
+*.lg-journal
+*.lg-wal
+*.lg-shm
+*.lg.agent-work/
+work/
+jobs/
+input/
+output/
+releases/

@@ -1,0 +1,35 @@
+{
+  "name": "linguagacha-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "UNLICENSED",
+  "description": "Standalone LinguaGacha project CLI and translation skill",
+  "bin": {
+    "lg-agent": "bin/lg-agent.mjs"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "check": "tsc --noEmit",
+    "doctor": "node bin/lg-agent.mjs doctor",
+    "verify": "npm run check && npm test && node scripts/check-boundaries.mjs",
+    "skills:sync": "node scripts/sync-skills.mjs",
+    "pretest": "npm run build"
+  },
+  "dependencies": {
+    "chardet": "2.2.0",
+    "iconv-lite": "0.7.0",
+    "jsonrepair": "3.13.1",
+    "typebox": "1.0.35"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "esbuild": "0.25.12",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3"
+  },
+  "engines": {
+    "node": ">=24.22.1"
+  }
+}

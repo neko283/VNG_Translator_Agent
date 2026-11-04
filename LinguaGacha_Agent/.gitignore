@@ -1,0 +1,11 @@
+node_modules/
+.npm-cache/
+.test-work/
+jobs/
+input/
+output/
+*.lg
+*.lg-journal
+*.lg-wal
+*.lg-shm
+*.lg.agent-work/
